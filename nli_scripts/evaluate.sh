@@ -23,15 +23,14 @@ saved_model=$3
 OUTPUT_MODEL_NAME=$4
 TASK=$5
 seed=$6
-train_dir_path=$7
 
 LR=2e-5
 EPOCH=2
-#EPOCH=1
+EPOCH=1
 MAXL=512
 LANGS="${LANG}"
 LC=""
-if [ $MODEL == "bert-base-multilingual-cased" ] || [ $MODEL == "bert-base-cased" ]; then
+if [ $MODEL == "bert-base-multilingual-cased" ]; then
   MODEL_TYPE="bert"
 elif [ $MODEL == "xlm-mlm-100-1280" ] || [ $MODEL == "xlm-mlm-tlm-xnli15-1024" ]; then
   MODEL_TYPE="xlm"
@@ -47,7 +46,7 @@ if [ $MODEL == "xlm-mlm-100-1280" ] || [ $MODEL == "xlm-roberta-large" ]; then
   #LR=3e-5
   LR=5e-6
 else
-  BATCH_SIZE=8
+  BATCH_SIZE=16
   GRAD_ACC=4
   LR=2e-5
 fi
@@ -64,9 +63,7 @@ python $PWD/run_classify.py \
   --train_language ${LANG} \
   --dev_language ${LANG} \
   --task_name $TASK \
-  --do_train \
-  --do_eval \
-  --do_predict \
+  --do_test \
   --data_dir $DATA_DIR/${TASK} \
   --gradient_accumulation_steps $GRAD_ACC \
   --per_gpu_train_batch_size $BATCH_SIZE \
@@ -82,4 +79,4 @@ python $PWD/run_classify.py \
   --overwrite_output_dir \
   --eval_test_set $LC \
   --seed $seed \
-  --train_dir_path $train_dir_path
+  --overwrite_cache

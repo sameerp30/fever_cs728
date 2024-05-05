@@ -48,14 +48,7 @@ from transformers import (
 
 from processors.utils import convert_examples_to_features
 from processors.xnli import XnliProcessor
-from processors.bnsentiment import BnSentimentProcessor
-from processors.mlheadline import MlHeadlineProcessor
-from processors.hiproduct import HiProductProcessor
-from processors.sst5 import SST5Processor
-from processors.marsentiment import MarSentimentProcessor
-from processors.snli import SnliProcessor
-from processors.semeval import SemevalProcessor
-from processors.gluecos import GluecosProcessor
+from processors.retriever import RetrieverProcessor
 
 try:
   from torch.utils.tensorboard import SummaryWriter
@@ -73,16 +66,7 @@ MODEL_CLASSES = {
 
 PROCESSORS = {
   'xnli': XnliProcessor,
-  'bnsentiment': BnSentimentProcessor,
-  'mlheadline': MlHeadlineProcessor,
-  'hiproduct': HiProductProcessor,
-  'sst5': SST5Processor,
-  'marsentiment': MarSentimentProcessor,
-  'marsentiment_promptonly': MarSentimentProcessor,
-  'snli': SnliProcessor,
-  'snli_promptonly': SnliProcessor,
-  'semeval': SemevalProcessor,
-  'gluecos': GluecosProcessor
+  "retriever": RetrieverProcessor
 }
 
 
@@ -101,7 +85,7 @@ def compute_metrics(preds, labels):
       fns[labels[i]] += 1
   scores = {
     "acc": (preds == labels).mean(),
-    "fscore": f1_score(labels, preds, average='macro'),
+    "fscore": f1_score(labels, preds, average='micro'),
     "num": len(
       preds), 
     "correct": (preds == labels).sum()
@@ -203,31 +187,6 @@ def train(args, train_dataset, model, tokenizer, lang2id=None):
   epochs_trained = 0
   steps_trained_in_current_epoch = 0
   
-  # Check if continuing training from a checkpoint
-  #if os.path.exists(args.model_name_or_path):
-  if False:
-    # set global_step to gobal_step of last saved checkpoint from model path
-    f = open("/home/ashish/benchmark/xtreme/outputs-temp/xnli/xlm-roberta-large-LR3e-5-epoch2-MaxLen128/eval_test_results")
-    lines = f.readlines()
-    length = len(lines)-1
-    required = None
-    while length >= 0:
-        line = lines[length]
-        if "=======" in line:
-            required = line
-            break
-        length -= 1
-    global_step = required[:-2].split("-")[1]
-    print("Starting from global step: ", global_step)
-    
-    #global_step = int(args.model_name_or_path.split("-")[-1].split("/")[0])
-    epochs_trained = global_step // (len(train_dataloader) // args.gradient_accumulation_steps)
-    steps_trained_in_current_epoch = global_step % (len(train_dataloader) // args.gradient_accumulation_steps)
-
-    logger.info("  Continuing training from checkpoint, will skip to saved global_step")
-    logger.info("  Continuing training from epoch %d", epochs_trained)
-    logger.info("  Continuing training from global step %d", global_step)
-    logger.info("  Will skip the first %d steps in the first epoch", steps_trained_in_current_epoch)
 
   best_score = 0
   best_checkpoint = None
@@ -298,17 +257,6 @@ def train(args, train_dataset, model, tokenizer, lang2id=None):
 
         if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:  # save steps is given as 100
           logger.info("loss is {}".format(loss.item()))
-          """if args.eval_test_set:
-            output_predict_file = os.path.join(args.output_dir, 'eval_test_results')
-            total = total_correct = 0.0
-            with open(output_predict_file, 'a') as writer:
-              writer.write('\n======= Predict using the model from checkpoint-{}:\n'.format(global_step))
-              for language in args.predict_languages.split(','):
-                result = evaluate(args, model, tokenizer, split=args.test_split, language=language, lang2id=lang2id, prefix='checkpoint-'+str(global_step))
-                writer.write('{}={}\n'.format(language, result['acc']))
-                total += result['num']
-                total_correct += result['correct']
-              writer.write('total={}\n'.format(total_correct / total))"""
 
           if args.save_only_best_checkpoint:  # this is set to true    
             result = evaluate(args, model, tokenizer, split='dev', language=args.dev_language, lang2id=lang2id, prefix=str(global_step))
@@ -455,6 +403,88 @@ def evaluate(args, model, tokenizer, split='train', language='en', lang2id=None,
 
   return results
 
+def test(args, model, tokenizer, split='train', language='en', lang2id=None, prefix="", output_file=None):
+  """Evalute the model."""
+  eval_task_names = (args.task_name,)
+  eval_outputs_dirs = (args.output_dir,)
+
+  for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
+    eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, split=split, language=language, lang2id=lang2id, evaluate=True)
+
+    if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
+      os.makedirs(eval_output_dir)
+
+    #args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+    args.eval_batch_size = args.per_gpu_eval_batch_size
+    # Note that DistributedSampler samples randomly
+    eval_sampler = SequentialSampler(eval_dataset)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+    # multi-gpu eval
+    # if args.n_gpu > 1:
+    #   model = torch.nn.DataParallel(model)
+
+    # Eval!
+    logger.info("***** Running evaluation {} {} *****".format(prefix, language))
+    logger.info("  Num examples = %d", len(eval_dataset))
+    logger.info("  Batch size = %d", args.eval_batch_size)
+    eval_loss = 0.0
+    nb_eval_steps = 0
+    preds = None
+    out_label_ids = None
+    sentences = None
+    softmax = torch.nn.Softmax(dim=1)
+    for batch in tqdm(eval_dataloader, desc="Evaluating"):
+    # for batch in eval_dataloader:
+      model.eval()
+      batch = tuple(t.to(args.device) for t in batch)
+
+      with torch.no_grad():
+        inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+        if args.model_type != "distilbert":
+          inputs["token_type_ids"] = (
+            batch[2] if args.model_type in ["bert"] else None
+          )  # XLM and DistilBERT don't use segment_ids
+        if args.model_type == "xlm":
+          inputs["langs"] = batch[4]
+        outputs = model(**inputs)
+        tmp_eval_loss, logits = outputs[:2]
+        # apply softmax to logits
+        logits = softmax(logits)
+        
+
+        eval_loss += tmp_eval_loss.mean().item()
+      nb_eval_steps += 1
+      if preds is None:
+        preds = logits.detach().cpu().numpy()
+        out_label_ids = inputs["labels"].detach().cpu().numpy()
+        sentences = inputs["input_ids"].detach().cpu().numpy()
+      else:
+        preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
+        out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
+        sentences = np.append(sentences, inputs["input_ids"].detach().cpu().numpy(), axis=0)
+
+    eval_loss = eval_loss / nb_eval_steps
+    logger.info("eval_loss this time is {}".format(eval_loss))
+    preds_class1 = preds[:, 1]
+    preds_classes = np.argmax(preds, axis=1)
+    
+    print("length of predictions are: ", len(preds_classes))
+
+    if output_file:
+      logger.info("***** Save prediction ******")
+      with open(output_file, 'w') as fout:
+        pad_token_id = tokenizer.pad_token_id
+        sentences = sentences.astype(int).tolist()
+        sentences = [[w for w in s if w != pad_token_id]for s in sentences]
+        sentences = [tokenizer.convert_ids_to_tokens(s) for s in sentences]
+        #fout.write('Prediction\tLabel\tSentences\n')
+        for p,p_class, s in zip(list(preds_class1), list(preds_classes), sentences):
+          s = ' '.join(s)
+          fout.write('{}\t{}\t{}\n'.format(s, p_class, p))
+
+
+
 
 def load_and_cache_examples(args, task, tokenizer, split='train', language='en', lang2id=None, evaluate=False):
   # Make sure only the first process in distributed training process the 
@@ -478,8 +508,8 @@ def load_and_cache_examples(args, task, tokenizer, split='train', language='en',
     ),
   )
   
-  # if os.path.exists(cached_features_file) and not args.overwrite_cache:
-  if False:
+  if os.path.exists(cached_features_file) and not args.overwrite_cache:
+  # if False:
     logger.info("Loading features from cached file %s", cached_features_file)
     features = torch.load(cached_features_file)
   else:
@@ -621,6 +651,7 @@ def main():
   )
   parser.add_argument("--do_train", action="store_true", help="Whether to run training.")
   parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the test set.")
+  parser.add_argument("--do_test", action="store_true", help="Whether to run eval on the test set.")
   parser.add_argument("--do_predict", action="store_true", help="Whether to run prediction.")
   parser.add_argument("--do_predict_dev", action="store_true", help="Whether to run prediction.")
   parser.add_argument("--init_checkpoint", type=str, default=None, help="initial checkpoint for predicting the dev set")
@@ -894,6 +925,19 @@ def main():
         total_correct += result['correct']
       writer.write('total={}\n'.format(total_correct / total))
 
+  # only get the output predictions
+  if args.do_test and args.local_rank in [-1, 0]:
+    tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name)
+    model = model_class.from_pretrained(best_checkpoint)
+    model.to(args.device)
+    output_predict_file = os.path.join(args.output_dir, args.test_split + '_results.txt')
+    total = total_correct = 0.0
+    with open(output_predict_file, 'a') as writer:
+      writer.write('======= Predict using the model from {} for {}:\n'.format(best_checkpoint, args.test_split))
+      for language in args.predict_languages.split(','):
+        output_file = os.path.join(args.data_dir, 'test-{}-results.tsv'.format(language))
+        test(args, model, tokenizer, split=args.test_split, language=language, lang2id=lang2id, prefix='best_checkpoint', output_file=output_file)
+
   if args.do_predict_dev:  # this is set to false
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path if args.model_name_or_path else best_checkpoint, do_lower_case=args.do_lower_case)
     model = model_class.from_pretrained(args.init_checkpoint)
@@ -910,7 +954,7 @@ def main():
         total_correct += result['correct']
       writer.write('total={}\n'.format(total_correct / total))
 
-  return result
+  # return result
 
 
 if __name__ == "__main__":
